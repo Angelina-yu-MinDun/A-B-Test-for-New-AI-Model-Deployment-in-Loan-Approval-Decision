@@ -5,7 +5,7 @@ This project evaluates whether deploying a new AI model improves loan approval d
 ## Project Links
 
 - [Published RPubs report](https://rpubs.com/Angelina_yu/1440697)
-- [HTML analysis report](reports/AB-Test-Loan-Officer.html)
+- [R Markdown analysis source](analysis/AB-Test-Loan-Officer.Rmd)
 - [Presentation PDF](presentation/AB-Test-New-AI-Model-Loan-Approval-Decisions.pdf)
 
 ## Business Question
@@ -51,10 +51,12 @@ Type II Reduction was not statistically significant. The report notes that this 
 ```text
 .
 ├── README.md
+├── analysis/
+│   └── AB-Test-Loan-Officer.Rmd
+├── data/
+│   └── data.csv
 ├── presentation/
 │   └── AB-Test-New-AI-Model-Loan-Approval-Decisions.pdf
-└── reports/
-    └── AB-Test-Loan-Officer.html
 ```
 
 ## Recommendations

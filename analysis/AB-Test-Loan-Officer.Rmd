@@ -1,0 +1,930 @@
+---
+title: "A/B Test for New AI Model Deployment in Loan Approval Decisions"
+
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+# Data Preparation and Data Understanding
+
+```{r Load Packages and Data, message=FALSE, warning=FALSE}
+# Load Packages and Data
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(tidyr)
+library(knitr)
+library(kableExtra)
+library(moments)
+library(broom)
+library(patchwork)
+library(purrr)
+library(car)
+library(tibble)
+library(effsize)
+library(rstatix)
+library(DiagrammeR)
+
+df <- read_csv("../data/data.csv", show_col_types = FALSE)
+```
+
+
+## Data Dictionary and Business Interpretation
+```{r Data Dictionary, echo=FALSE}
+dictionary <- data.frame(
+
+Variable=c(
+"Variant",
+"loanofficer_id",
+"day",
+
+"typeI_init",
+"typeI_fin",
+"typeII_init",
+"typeII_fin",
+"ai_typeI",
+"ai_typeII",
+"badloans_num",
+"goodloans_num",
+
+"agree_init",
+"agree_fin",
+"conflict_init",
+"conflict_fin",
+
+"revised_per_ai",
+"revised_agst_ai",
+
+"confidence_init_total",
+"confidence_fin_total",
+"complt_init",
+"complt_fin",
+"fully_complt"
+),
+
+Technical_Meaning=c(
+
+"Experimental group assignment",
+"Unique ID of loan officer",
+"Experiment day",
+
+"Initial Type I errors",
+"Final Type I errors",
+"Initial Type II errors",
+"Final Type II errors",
+"AI Type I errors",
+"AI Type II errors",
+"Number of bad loans",
+"Number of good loans",
+
+"Initial agreement with AI",
+"Final agreement with AI",
+"Initial conflict with AI",
+"Final conflict with AI",
+
+"Revised decisions following AI",
+"Revised decisions against AI",
+
+"Initial confidence score",
+"Final confidence score",
+"Initial completed decisions",
+"Final completed decisions",
+"Fully completed reviews"
+),
+
+Business_Interpretation=c(
+
+"Determine whether officers use old or new AI model",
+"Track individual performance differences",
+"Observe time trend and learning effect",
+
+"Opportunity loss from rejecting good customers",
+"Final opportunity cost after AI assistance",
+"Potential bad debt due to human decisions",
+"Direct financial losses from approving bad loans",
+"AI-caused loss of good customers",
+"AI-caused bad debt risk",
+"Actual defaulted loans",
+"Actual profitable loans",
+
+"Similarity between human and AI before intervention",
+"Degree of accepting AI suggestions",
+"Initial disagreement with AI",
+"Remaining disagreement after AI",
+
+"Degree to which AI influences humans",
+"Degree to which humans override AI",
+
+"Human confidence before AI",
+"Confidence after AI assistance",
+"Initial workload",
+"Final workload",
+"Actual completed workload"
+)
+)
+
+kable(
+dictionary,
+) %>%
+
+kable_styling(
+bootstrap_options=c(
+"striped",
+"hover",
+"condensed"
+),
+full_width=TRUE
+)
+```
+
+
+## Data-Cleaning
+Observations with fully_complt=0 were removed because these loan reviews did not complete both stages of the decision process and therefore were not suitable for evaluating Model-assisted decision quality.
+```{r data-cleaning}
+
+# original data
+n_before <- nrow(df)
+
+# remove the data that didn't complete fully process(Officer -> Model -> Final)
+data_clean <- df %>%
+    filter(fully_complt > 0)
+
+# after cleaning
+n_after <- nrow(data_clean)
+
+removed <- n_before-n_after
+
+cleaning_summary <- data.frame(
+    Before=n_before,
+    After=n_after,
+    Removed=removed
+)
+group_summary <- data_clean %>%
+
+group_by(Variant) %>% summarise(n_observations=n(), n_officers=n_distinct(loanofficer_id))
+```
+
+```{r group-summary, echo=FALSE}
+knitr::kable(
+  group_summary,
+  digits = 2
+) %>%
+  kable_styling(
+    full_width = FALSE,
+    position = "left"
+  )
+```
+After data cleaning, the dataset contained:
+
+- Control group: 100 observations from 10 loan officers
+- Treatment group: 280 observations from 28 loan officers
+
+Although the sample sizes differ across groups, subsequent analyses were conducted at the loan-officer level rather than the individual observation level to avoid giving excessive weight to officers with larger workloads.
+
+## Officer-Level Aggregation and Metric Construction
+
+The dataset contains repeated observations for each loan officer across a 10-day review period. During these ten days, each officer processed multiple loan applications and generated multiple decision records. Therefore, the raw dataset contains repeated measurements for the same individual officer.
+
+To evaluate the overall performance of each loan officer and avoid treating repeated daily records as independent observations, the data were *aggregated at the officer level*. All relevant variables were summed across the 10-day period for each `loanofficer_id`.
+
+The aggregated variables include:
+
+- Initial and final Type I errors
+- Initial and final Type II errors
+- AI Type I and Type II errors
+- Numbers of good loans and bad loans
+- Agreement and conflict measures
+- Revision behavior toward AI recommendations
+- Completion metrics
+
+```{r merge officer data}
+officer_summary <- data_clean %>%
+  group_by(loanofficer_id, Variant) %>%
+  summarise(
+    total_typeI_init = sum(typeI_init),
+    total_typeI_fin = sum(typeI_fin),
+    total_typeII_init = sum(typeII_init),
+    total_typeII_fin = sum(typeII_fin),
+    total_ai_typeI = sum(ai_typeI),
+    total_ai_typeII = sum(ai_typeII),
+    total_badloans = sum(badloans_num),
+    total_goodloans = sum(goodloans_num),
+    total_agree_init = sum(agree_init),
+    total_agree_fin = sum(agree_fin),
+    total_conflict_init = sum(conflict_init),
+    total_conflict_fin = sum(conflict_fin),
+    total_revised_per_ai = sum(revised_per_ai),
+    total_revised_agst_ai = sum(revised_agst_ai),
+    total_complt_init = sum(complt_init),
+    total_complt_fin = sum(complt_fin),
+    total_fully_complt = sum(fully_complt),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Variant = factor(Variant, levels = c("Control", "Treatment"))
+  ) %>%
+  arrange(Variant, loanofficer_id)
+```
+
+```{r Table of mergeing officer data,echo=FALSE}
+
+knitr::kable(
+  officer_summary,
+  digits = 2
+) %>%
+kableExtra::kable_styling(
+  full_width = FALSE
+)
+```
+
+## Preliminary Investigation of Model Performance
+Before defining the Overall Evaluation Criteria (OECs), the Model-related metrics were examined.
+
+During data preparation, all loan officers within the same experimental variant were found to have identical AI Type I and AI Type II error counts. This indicates that these metrics reflect the performance of the AI model assigned to each variant rather than individual officer behaviour.
+
+```{r ai_typeII_rate}
+ai_model_performance <- officer_summary %>%
+  mutate(
+    ai_typeII_rate = total_ai_typeII / total_badloans
+  ) %>%
+  group_by(Variant) %>%
+  summarise(
+    ai_typeII_rate = unique(ai_typeII_rate),
+    n_officers = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    ai_typeII_rate = round(ai_typeII_rate, 3),
+    ai_typeII_rate_pct = paste0(round(ai_typeII_rate * 100, 1), "%")
+  )
+```
+$$
+AI\ TypeII\ Rate=
+\frac{ai\_typeII}
+{badloans}
+$$
+```{r ai_typeII_rate table,echo=FALSE}
+kable(
+  ai_model_performance,
+  caption = "Preliminary Investigation of AI Model Type II Error Rate",
+  col.names = c(
+    "Variant",
+    "AI Type II Rate",
+    "Number of Officers",
+    "AI Type II Rate (%)"
+  )
+) %>%
+  kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "hover", "condensed")
+  )
+```
+
+A descriptive comparison shows that the **Treatment model achieved a substantially lower AI Type II error rate than the Control model (26.7% vs. 53.3%)**, suggesting improved predictive performance in identifying bad loans.
+
+Because these metrics do not vary across officers within the same variant, they are not suitable for inferential statistical testing and are instead used as diagnostic indicators of model quality.
+
+As the objective of the experiment is to assess whether improved AI predictions lead to better loan decisions, the subsequent OECs focus on outcomes arising from human–AI interaction rather than model performance alone.
+
+
+# Overall Evaluation Criteria (OEC) Definition
+To evaluate whether the new AI model improves loan officers’ decision quality, one primary OEC and several key supporting OECs were defined. The primary OEC focuses on the company’s main business objective, while the supporting OECs help explain the mechanism through which the model may influence decision performance.
+
+## Primary OEC – Final Type II Rate
+$$
+Final\ TypeII\ Rate=
+\frac{typeII_{fin}}
+{Total Badloans}
+$$
+The primary OEC is defined as the proportion of bad loans that were incorrectly approved after Model-assisted review.
+
+This metric was selected because **the company’s primary concern is approving loans that later default**. Reducing Type II errors directly lowers potential financial losses and reflects the key business objective.
+
+A lower Final Type II Rate indicates better decision quality (**smaller-is-better**). Therefore, the Treatment group is expected to achieve a lower Final Type II Rate than the Control group, suggesting that the new AI model can better support officers in identifying risky loan applications.
+
+## Supporting OEC 1 – Type II Reduction
+
+$$
+TypeII\ Reduction=
+Init\ TypeII\ Rate
+-
+Final\ TypeII\ Rate
+$$
+Type II Reduction measures how much officers corrected Type II errors after receiving Model recommendations by comparing initial and final Type II error rates.
+
+A larger value indicates greater reduction in Type II errors after interacting with Model recommendations (**larger-is-better**). This metric helps evaluate whether Model assistance improves decision-making performance beyond officers’ initial decisions.
+
+The Treatment group is expected to show a larger Type II Reduction, suggesting that the new AI model may better support officers in identifying and correcting risky approval decisions.
+
+## Supporting OEC 2 – Agreement Lift
+$$
+Agreement\ Lift=
+Agree_{fin\_rate}
+-
+Agree_{init\_rate}
+$$
+Agreement Lift measures the increase in agreement between officers and Model recommendations from initial to final decisions.
+
+A larger value indicates that officers became more aligned with Model recommendations after receiving Model assistance (**larger-is-better**). This metric reflects the extent to which officers adjusted their decisions toward Model recommendations.
+
+## Supporting OEC 3 – Conflict Reduction
+$$
+Conflict\ Reduction=
+Conflict_{init\_rate}
+-
+Conflict_{fin\_rate}
+$$
+Conflict Reduction measures the decrease in disagreement between officers and Model recommendations from initial to final decisions.
+
+A larger value indicates fewer conflicts between officers and Model recommendations after Model assistance (**larger-is-better**). Together with Agreement Lift, this metric reflects changes in alignment between officers and Model during the decision-making process.
+
+```{r Creat OEC}
+
+officer_summary <- officer_summary %>%
+  
+mutate(
+  
+# Primary OEC
+final_typeII_rate = total_typeII_fin / total_badloans,
+
+# Supporting OEC 1
+init_typeII_rate = total_typeII_init / total_badloans,
+typeII_reduction = init_typeII_rate - final_typeII_rate,
+
+# Supporting OEC 2
+agree_init_rate = total_agree_init / total_fully_complt,
+agree_fin_rate = total_agree_fin / total_fully_complt,
+agreement_lift = agree_fin_rate - agree_init_rate,
+
+# Supporting OEC 3
+conflict_init_rate = total_conflict_init / total_fully_complt,
+conflict_fin_rate = total_conflict_fin / total_fully_complt,
+conflict_reduction = conflict_init_rate - conflict_fin_rate
+
+)
+
+```
+
+```{r Table of creating OEC, echo=FALSE}
+
+knitr::kable(
+officer_summary %>%
+select(
+loanofficer_id,
+Variant,
+final_typeII_rate,
+typeII_reduction,
+agreement_lift,
+conflict_reduction
+),
+digits=3
+) %>%
+kableExtra::kable_styling(
+full_width=TRUE
+)
+```
+
+# Statistical Assumption Assessment
+## Normality Assessment
+Before selecting statistical methods, the distribution of each OEC was examined within the Control and Treatment groups.
+
+Normality was assessed using three complementary approaches. First, the Shapiro–Wilk test was used as a formal statistical test. Second, skewness, kurtosis, mean, median, and standard deviation were calculated to summarize distribution shape and potential asymmetry. Third, Q-Q plots and histograms were used to visually inspect whether each metric followed an approximately normal distribution.
+
+The hypotheses for the Shapiro–Wilk test are:
+
+\[
+H_0: \text{The data follows a normal distribution}
+\]
+
+\[
+H_1: \text{The data does not follow a normal distribution}
+\]
+
+A p-value greater than 0.05 indicates insufficient evidence to reject the normality assumption, while a p-value below 0.05 suggests that the metric may deviate from normality.
+```{r check oec normality}
+
+vars <- c(
+  "final_typeII_rate",
+  "typeII_reduction",
+  "agreement_lift",
+  "conflict_reduction"
+)
+
+normality_summary <- lapply(vars, function(v){
+
+  officer_summary %>%
+    group_by(Variant) %>%
+    summarise(
+      Variable = v,
+
+      Shapiro_p =
+        shapiro.test(.data[[v]])$p.value,
+
+      Skewness =
+        skewness(.data[[v]], na.rm=TRUE),
+
+      Kurtosis =
+        kurtosis(.data[[v]], na.rm=TRUE),
+
+      Mean =
+        mean(.data[[v]], na.rm=TRUE),
+
+      Median =
+        median(.data[[v]], na.rm=TRUE),
+
+      SD =
+        sd(.data[[v]], na.rm=TRUE),
+
+      .groups="drop"
+    )
+
+}) %>%
+bind_rows()
+
+normality_summary
+```
+
+The Q-Q plots provide visual evidence of normality by comparing the observed data distribution with a theoretical normal distribution. If the points closely follow the reference line, the normality assumption is more plausible. Histograms were also used to identify skewness, heavy tails, or irregular distribution patterns.
+
+```{r oec normality plot, fig.width=6, fig.height=8, echo=FALSE}
+plot_data <- officer_summary %>%
+  select(
+    Variant,
+    final_typeII_rate,
+    typeII_reduction,
+    agreement_lift,
+    conflict_reduction
+  ) %>%
+  pivot_longer(
+    cols = -Variant,
+    names_to = "Variable",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Variable = factor(
+      Variable,
+      levels = c(
+        "final_typeII_rate",
+        "typeII_reduction",
+        "agreement_lift",
+        "conflict_reduction"
+      )
+    )
+  )
+
+p1 <- ggplot(
+  plot_data,
+  aes(sample = Value)
+) +
+  stat_qq() +
+  stat_qq_line() +
+  facet_grid(
+    Variable ~ Variant,
+    scales = "fixed"
+  ) +
+  theme_bw()
+
+p2 <- ggplot(
+  plot_data,
+  aes(x = Value)
+) +
+  geom_histogram(
+    bins = 40,
+    color = "black"
+  ) +
+  facet_grid(
+    Variable ~ Variant,
+    scales = "fixed"
+  ) +
+  theme_bw()
+
+(p1 / p2) +
+plot_layout(heights = c(8, 8))
+```
+
+**The results showed that Final Type II Rate satisfied the normality assumption, while Type II Reduction, Agreement Lift, and Conflict Reduction violated normality assumptions.**
+
+
+
+## Homogeneity of Variance Assessment
+Levene’s test was used because it is more robust than the traditional F-test when the data may deviate from normality.
+
+The hypotheses for Levene’s test are:
+
+\[
+H_0: \sigma^2_{Control} = \sigma^2_{Treatment}
+\]
+
+\[
+H_1: \sigma^2_{Control} \neq \sigma^2_{Treatment}
+\]
+
+where \(\sigma^2_{Control}\) and \(\sigma^2_{Treatment}\) represent the variances of the OEC in the Control and Treatment groups, respectively.
+
+**A p-value greater than 0.05 indicates insufficient evidence to reject the equal variance assumption**, suggesting that the homogeneity of variance assumption is satisfied. A p-value below 0.05 indicates unequal variances between groups.
+```{r oec Levene test}
+# Levene test
+levene_results <- map_dfr(vars, function(v){
+
+  result <- leveneTest(
+    as.formula(paste(v, "~ Variant")),
+    data = officer_summary
+  )
+
+  tibble(
+    Variable = v,
+    F_value = round(result$`F value`[1],3),
+    P_value = round(result$`Pr(>F)`[1],4),
+    
+    Assumption = ifelse(
+      result$`Pr(>F)`[1] > 0.05,
+      "Satisfied (Equal Variance)",
+      "Not satisfied (Unequal Variance)"
+    )
+  )
+
+})
+
+levene_results
+```
+
+## Statistical Test and Effect Size Selection
+
+After evaluating the normality and homogeneity of variance assumptions, appropriate statistical tests were selected for each OEC.
+
+For variables that satisfied the normality assumption, parametric tests were preferred because they generally provide greater statistical power. When the equal variance assumption was violated, Welch’s t-test was selected because it is robust to unequal variances between groups.
+
+For variables that violated the normality assumption, the Wilcoxon rank-sum test was used. This non-parametric alternative does not require normally distributed data and is suitable for comparing two independent groups.
+
+The decision rules used for statistical test selection are summarized below:
+
+```{r test-selection-table, echo=FALSE, message=FALSE, warning=FALSE}
+test_rules <- tibble( Normality = c( "Satisfied", "Satisfied", "Not satisfied" ), `Homogeneity of Variance` = c( "Satisfied", "Not satisfied", "Either satisfied or not satisfied" ), `Statistical Test` = c( "Independent t-test", "Welch's t-test", "Wilcoxon rank-sum test" ) )
+
+kable( test_rules, align = "l", caption = "Statistical Test Selection Rules" ) %>% kable_styling( full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed") )
+```
+
+While hypothesis tests indicate whether an observed difference is statistically significant, they do not describe the magnitude or practical importance of that difference. Therefore, **effect sizes were calculated to quantify the strength of the observed effects.**
+
+Different effect size measures were used depending on the statistical test applied.
+
+For t-tests, Cohen's d was used to measure the standardized difference between group means.
+For Wilcoxon rank-sum tests, the rank-biserial effect size (r) was used because it is appropriate for non-parametric comparisons.
+
+The interpretation guidelines are summarized below:
+
+```{r Effect Size Assessment-selection-table, echo=FALSE, message=FALSE, warning=FALSE}
+effect_guidelines <- tibble( `Effect Size Measure` = c( "Cohen's d", "Wilcoxon r" ), Small = c( "0.20", "0.10" ), Medium = c( "0.50", "0.30" ), Large = c( "0.80", "0.50" ) )
+
+kable( effect_guidelines, align = "lcccc", caption = "Effect Size Interpretation Guidelines" ) %>% kable_styling( full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed") )
+```
+
+The thresholds above were used to interpret the practical magnitude of the observed effects.
+
+The final statistical methods and corresponding effect size measures selected for each OEC are summarized below:
+```{r test_selection table, echo=FALSE, message=FALSE, warning=FALSE}
+test_selection <- tibble( OEC = c( "Final Type II Rate", "Type II Reduction", "Agreement Lift", "Conflict Reduction" ), Normality = c( "Satisfied", "Not satisfied", "Not satisfied", "Not satisfied" ), `Homogeneity of Variance` = c( "Not satisfied", "Satisfied", "Satisfied", "Satisfied" ), `Statistical Test` = c( "Welch's t-test", "Wilcoxon rank-sum test", "Wilcoxon rank-sum test", "Wilcoxon rank-sum test" ), `Effect Size Measure` = c( "Cohen's d", "Wilcoxon r", "Wilcoxon r", "Wilcoxon r" ) )
+
+kable( test_selection, align = "l", caption = "Statistical Test and Effect Size Selection for Each OEC" ) %>% kable_styling( full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed") )
+```
+
+
+# Statistical Test and Results
+
+## Primary OEC
+\[
+H_0:\ \mu_{Control} ≤ \mu_{Treatment}
+\]
+
+\[
+H_1:\ \mu_{Control} > \mu_{Treatment}
+\]
+
+where \(\mu\) represents the mean Final Type II Rate.
+
+```{r Welch t.test final_typeII_rate}
+t_final_typeII_rate <- t.test(
+final_typeII_rate~Variant,
+var.equal=FALSE,
+data=officer_summary
+)
+```
+
+```{r Welch t.test final_typeII_rate result}
+t_final_typeII_rate
+```
+
+Since **p < 0.05**, the null hypothesis is rejected.
+
+The Treatment model significantly reduced the proportion of bad loans incorrectly approved by loan officers.
+
+Compared with the Control model, the Treatment model reduced the Final Type II Rate by approximately:
+
+\[
+39.3\% - 26.8\% = 12.5\%
+\]
+
+This corresponds to a reduction of **12.5 percentage points** in Final Type II errors.
+
+```{r effective size final_typeII_rate result}
+
+cohen.d(
+ final_typeII_rate~Variant,
+ data=officer_summary
+)
+```
+
+This indicates that the difference between the Control and Treatment groups is not only statistically significant but also practically meaningful.
+
+**Combined with the statistically significant Welch's t-test result and the large effect size, suggesting that the Treatment model produced a substantial reduction in Final Type II errors and generated a meaningful improvement in loan approval quality.**
+
+## Supporting OEC
+
+\[
+H_0:\ Control ≥ Treatment
+\]
+
+\[
+H_1:\ Control < Treatment
+\]
+
+```{r Wilcoxon test}
+w_typeII <- wilcox.test(
+  typeII_reduction ~ Variant,
+  data=officer_summary,
+  alternative="less"
+)
+
+w_agreement <- wilcox.test(
+  agreement_lift ~ Variant,
+  data=officer_summary,
+  alternative="less"
+)
+
+w_conflict <- wilcox.test(
+  conflict_reduction ~ Variant,
+  data=officer_summary,
+  alternative="less"
+)
+```
+
+
+```{r Wilcoxon test typeII reduction results}
+w_typeII
+```
+
+
+```{r typeII_reduction effectsize}
+
+officer_summary %>%
+  wilcox_effsize(
+    typeII_reduction ~ Variant
+  )
+```
+
+
+```{r Wilcoxon test agreement lift results}
+w_agreement
+```
+
+
+```{r agreement lift effectsize}
+officer_summary %>%
+  wilcox_effsize(
+    agreement_lift ~ Variant
+  )
+```
+
+
+```{r Wilcoxon test conflict reduction results}
+w_conflict
+```
+
+
+```{r conflict_reduction effectsize}
+officer_summary %>%
+  wilcox_effsize(
+    conflict_reduction ~ Variant
+  )
+```
+
+
+```{r oec-result-summary, echo=FALSE, message=FALSE, warning=FALSE}
+oec_summary <- tibble(
+  OEC = c(
+    "Final Type II Rate",
+    "Type II Reduction",
+    "Agreement Lift",
+    "Conflict Reduction"
+  ),
+  `Statistical Test` = c(
+    "Welch's t-test",
+    "Wilcoxon",
+    "Wilcoxon",
+    "Wilcoxon"
+  ),
+  `P-value` = c(
+    "0.0056",
+    "0.2559",
+    "0.0049",
+    "0.0109"
+  ),
+  `Significant` = c(
+    "Yes",
+    "No",
+    "Yes",
+    "Yes"
+  ),
+  `Effect Size` = c(
+    "d = 1.67",
+    "r = 0.11",
+    "r = 0.411",
+    "r = 0.368"
+  ),
+  Magnitude = c(
+    "Large",
+    "Small",
+    "Moderate",
+    "Moderate"
+  ),
+  Interpretation = c(
+    "Treatment reduced Final Type II Rate",
+    "No evidence of greater Type II Reduction",
+    "Higher adoption of AI recommendations",
+    "Lower disagreement with AI"
+  )
+)
+
+kable(
+  oec_summary,
+  caption = "Overall OEC Results Summary",
+  align = "l"
+) %>%
+  kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "hover", "condensed")
+  )
+```
+
+Based on the statistical analyses above, several key findings can be drawn.
+
+First, with respect to the **final Type II Error rate**, collaboration between loan officers and the new AI model **significantly reduced the risk of ultimately approving bad loans**. Furthermore, the new model demonstrated a lower Type II Error rate than the Control group using the legacy model.
+
+In addition, both **Agreement Lift** and **Conflict Reduction** **increased significantly**. These results suggest a consistent behavioral pattern: after being exposed to recommendations from the new AI model, loan officers were more likely to align their decisions with the AI's recommendations. This indicates a higher level of trust in, and adoption of, the new model, resulting in stronger human-AI decision alignment compared to the legacy model.
+
+However, although the Final Type II Rate was significantly lower among users of the new model, the increase in **Type II Reduction—a metric intended to capture the AI’s ability to improve human decisions—did not reach statistical significance**. There are at least two plausible explanations for this result.
+
+**1. Insufficient Statistical Power**
+
+The Control group included only 10 participants versus 28 in the Treatment group, creating a notable sample imbalance. Combined with the Wilcoxon test’s limited sensitivity to small effects (observed effect size: r = 0.11), the study may have lacked sufficient statistical power to detect a real but modest difference.
+
+As a result, the non-significant finding may reflect a statistical Type II error rather than the absence of a true improvement effect from the new model.
+
+**2. Baseline Differences Between Groups**
+
+If the Treatment group already had a relatively low initial Type II Error rate, the new AI model would have less room to improve performance. In contrast, the Control group’s higher initial error rate would allow greater improvement even with the legacy model.
+
+To test this, an additional analysis was conducted on initial Type II Error rates before Model intervention.
+
+```{r baseline, echo=FALSE, message=FALSE, warning=FALSE}
+# 1. Descriptive statistics
+baseline_summary <- officer_summary %>%
+  group_by(Variant) %>%
+  summarise(
+    n_officers = n(),
+    mean = round(mean(init_typeII_rate, na.rm = TRUE), 3),
+    median = round(median(init_typeII_rate, na.rm = TRUE), 3),
+    sd = round(sd(init_typeII_rate, na.rm = TRUE), 3),
+    min = round(min(init_typeII_rate, na.rm = TRUE), 3),
+    max = round(max(init_typeII_rate, na.rm = TRUE), 3),
+    .groups = "drop"
+  )
+
+# 2. Normality test
+baseline_normality <- officer_summary %>%
+  group_by(Variant) %>%
+  summarise(
+    Shapiro_p = round(shapiro.test(init_typeII_rate)$p.value, 4),
+    Normality = ifelse(Shapiro_p < 0.05, "Not normal", "Normal"),
+    .groups = "drop"
+  )
+
+# 3. Levene test
+levene_res <- leveneTest(
+  init_typeII_rate ~ Variant,
+  data = officer_summary
+)
+
+levene_p <- round(levene_res$`Pr(>F)`[1], 4)
+
+variance_result <- ifelse(
+  levene_p < 0.05,
+  "Unequal variance",
+  "Equal variance"
+)
+
+# 4. Wilcoxon test
+w_baseline <- wilcox.test(
+  init_typeII_rate ~ Variant,
+  data = officer_summary,
+  alternative = "two.sided"
+)
+
+wilcox_p <- round(w_baseline$p.value, 4)
+wilcox_w <- round(as.numeric(w_baseline$statistic), 1)
+
+# 5. Final summary table
+baseline_test_summary <- tibble(
+  Metric = c(
+    "Control mean Initial Type II Error Rate",
+    "Treatment mean Initial Type II Error Rate",
+    "Control median Initial Type II Error Rate",
+    "Treatment median Initial Type II Error Rate",
+    "Control normality",
+    "Treatment normality",
+    "Variance homogeneity",
+    "Selected statistical test",
+    "Test statistic",
+    "p-value",
+    "Conclusion"
+  ),
+  Result = c(
+    baseline_summary$mean[baseline_summary$Variant == "Control"],
+    baseline_summary$mean[baseline_summary$Variant == "Treatment"],
+    baseline_summary$median[baseline_summary$Variant == "Control"],
+    baseline_summary$median[baseline_summary$Variant == "Treatment"],
+    paste0(
+      "Shapiro-Wilk p = ",
+      baseline_normality$Shapiro_p[baseline_normality$Variant == "Control"],
+      " (",
+      baseline_normality$Normality[baseline_normality$Variant == "Control"],
+      ")"
+    ),
+    paste0(
+      "Shapiro-Wilk p = ",
+      baseline_normality$Shapiro_p[baseline_normality$Variant == "Treatment"],
+      " (",
+      baseline_normality$Normality[baseline_normality$Variant == "Treatment"],
+      ")"
+    ),
+    paste0(
+      "Levene p = ",
+      levene_p,
+      " (",
+      variance_result,
+      ")"
+    ),
+    "Wilcoxon rank-sum test",
+    paste0("W = ", wilcox_w),
+    wilcox_p,
+    ifelse(
+      wilcox_p < 0.05,
+      "Significant baseline difference",
+      "No significant baseline difference"
+    )
+  )
+)
+
+kable(
+  baseline_test_summary,
+  caption = "Baseline Type II Error Rate Comparison Summary",
+  align = "l"
+) %>%
+  kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "hover", "condensed")
+  )
+```
+
+The results confirmed this hypothesis: the Control group had a significantly higher initial Type II Rate than the Treatment group. This baseline difference likely explains why Type II Reduction was not statistically significant. While the new model achieved better final outcomes, the Treatment group’s lower starting error rate limited its potential improvement, making the observed reduction comparable to that of the Control group.
+
+
+# Conclusion and Recommendations
+
+Taken together, the results indicate that the new AI model provides meaningful business value by reducing bad-loan approvals and improving human-AI decision alignment. The primary OEC was statistically significant with a large effect size (Cohen’s d = 1.67), providing strong evidence that the new model outperforms the legacy model.
+
+Although Type II Reduction was not statistically significant, this is likely due to limited statistical power and baseline differences between groups rather than a lack of model effectiveness. Overall, the findings support adoption of the new model while continuing to strengthen the evidence through further data collection.
+
+Based on these findings, the following actions are recommended:
+
+**1. Proceed with a Controlled Rollout**
+
+The model has demonstrated a measurable reduction in bad-loan approval risk. To avoid continued exposure to the higher risk associated with the legacy model, a controlled rollout is recommended while performance continues to be monitored.
+
+**2. Continue Data Collection and Improve Experimental Design **
+
+Additional data should be collected during rollout to increase statistical power and confidence in the results. Future studies should aim for more balanced Control and Treatment groups (ideally 20–30 participants each). Where resources are limited, cross-over or matched-pair designs may help reduce individual-level variation.
+
+**3. Broaden Evaluation Metrics and Analysis**
+
+Future evaluations should assess both Type II and Type I Errors to better understand the risk-return trade-off and ensure risk reduction does not come at the cost of rejecting profitable loans.
+
+If case-level data become available, decision-path analysis (Human Initial Decision × AI Recommendation × Human Final Decision × Actual Loan Outcome) could provide deeper insight into how and when the AI improves human decision-making.
+
